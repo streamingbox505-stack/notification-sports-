@@ -53,6 +53,9 @@ jobs:
           PUSH_LANGS: ${{ vars.PUSH_LANGS || 'sw,en,fr,ar' }}
           SCORE_BOX: ${{ vars.SCORE_BOX || '0.02,0.03,0.32,0.09' }}
           BANNER_BOX: ${{ vars.BANNER_BOX || '0.05,0.74,0.60,0.14' }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DATA_REPO: ${{ vars.GOAL_DATA_REPO || 'jaynesmaxtv/goal-audio' }}
+          TRAIN_COLLECT: ${{ vars.TRAIN_COLLECT || '1' }}   # '0' = usikusanye data ya mafunzo
       - name: Hifadhi picha za kukagua (calibration)
         if: always()
         uses: actions/upload-artifact@v4
@@ -60,3 +63,4 @@ jobs:
           name: debug-frames
           path: debug/
           if-no-files-found: ignore
+          
