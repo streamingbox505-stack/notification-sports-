@@ -1,0 +1,62 @@
+name: Watch match
+run-name: Watch ${{ inputs.slug }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:    { description: "slug ya mechi (kutoka fawa-live)", required: true }
+      title:   { description: "Timu A vs Timu B", required: true }
+      kickoff: { description: "Saa ya kuanza HH:MM (Dar es Salaam)", default: "" }
+      logo:    { description: "URL ya nembo ya mechi (https, hiari)", default: "" }
+      dry_run: { description: "true = haitumi push, inaonyesha kwenye log tu", default: "true" }
+
+concurrency:
+  group: watch-${{ inputs.slug }}
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-${{ vars.WHISPER_MODEL || 'small' }}
+      - name: Sakinisha ffmpeg, OCR na ASR
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg tesseract-ocr tesseract-ocr-ara tesseract-ocr-fra
+          pip install -q numpy pillow pytesseract faster-whisper huggingface_hub
+      - name: Pakua model yako ya goal (ikiwepo)
+        continue-on-error: true
+        run: python -c "import os; from huggingface_hub import hf_hub_download as d; print(d(os.environ['MODEL_REPO'], 'goal_model.json', token=os.environ['HF_TOKEN'], local_dir='.'))"
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODEL_REPO: ${{ vars.GOAL_MODEL_REPO || 'jaynesmaxtv/goal-audio-model' }}
+      - name: Fuatilia mechi
+        run: python watch_match.py
+        env:
+          SLUG: ${{ inputs.slug }}
+          TITLE: ${{ inputs.title }}
+          KICKOFF: ${{ inputs.kickoff }}
+          LOGO: ${{ inputs.logo }}
+          DRY_RUN: ${{ inputs.dry_run == 'false' && '0' || '1' }}
+          CONTENT_URL: ${{ vars.CONTENT_URL || 'https://ooqvsqmsnwjqvuzbhczx.supabase.co' }}
+          CONTENT_KEY: ${{ secrets.CONTENT_KEY }}
+          PUSH_SECRET: ${{ secrets.PUSH_SECRET }}
+          WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'small' }}
+          PUSH_LANGS: ${{ vars.PUSH_LANGS || 'sw,en,fr,ar' }}
+          SCORE_BOX: ${{ vars.SCORE_BOX || '0.02,0.03,0.32,0.09' }}
+          BANNER_BOX: ${{ vars.BANNER_BOX || '0.05,0.74,0.60,0.14' }}
+      - name: Hifadhi picha za kukagua (calibration)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-frames
+          path: debug/
+          if-no-files-found: ignore
