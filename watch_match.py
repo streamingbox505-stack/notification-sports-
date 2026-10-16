@@ -16,14 +16,19 @@ import goalaudio as ga
 import matchtext as mt
 
 E = os.environ.get
-URL, AUTH, SLUG, TITLE = E("URL", "").strip(), E("AUTH", "").strip(), E("SLUG", "").strip(), E("TITLE", "Home vs Away").strip()
+SLUG, TITLE = E("SLUG", "").strip(), E("TITLE", "Home vs Away").strip()
+CONTENT_URL, CONTENT_KEY = E("CONTENT_URL", "").rstrip("/"), E("CONTENT_KEY", "").strip()
+# URL ya moja kwa moja (kwa majaribio) au stream ya fawa-live kupitia proxy yako (ile ile ambayo app inatumia)
+URL = E("URL", "").strip() or (f"{CONTENT_URL}/functions/v1/fawa-live/proxy?slug={urllib.parse.quote(SLUG)}" if CONTENT_URL and SLUG else "")
+AUTH = E("AUTH", "").strip() or (f"Bearer {CONTENT_KEY}" if CONTENT_KEY else "")
 KICKOFF, MAX_MIN, WAIT_MIN = E("KICKOFF", "").strip(), int(E("MAX_MINUTES", "150")), int(E("WAIT_START_MIN", "25"))
 DRY, SCORER_WAIT, WHISPER = E("DRY_RUN", "1") != "0", int(E("SCORER_WAIT", "12")), E("WHISPER_MODEL", "small")
 LANGS = [l for l in E("PUSH_LANGS", "sw,en,fr,ar").split(",") if l in mt.LANGS] or ["sw", "en"]
-PUSH_URL, PUSH_SECRET = E("PUSH_URL", ""), E("PUSH_SECRET", "")
+PUSH_URL, PUSH_SECRET = E("PUSH_URL", "") or (f"{CONTENT_URL}/functions/v1/send-push" if CONTENT_URL else ""), E("PUSH_SECRET", "")
 SCORE_BOX = [float(v) for v in E("SCORE_BOX", "0.02,0.03,0.32,0.09").split(",")]    # x,y,w,h kama sehemu ya fremu
 BANNER_BOX = [float(v) for v in E("BANNER_BOX", "0.05,0.74,0.60,0.14").split(",")]
 SAVE_DEBUG = E("SAVE_DEBUG", "1") != "0"
+LOGO = E("LOGO", "").strip() if E("LOGO", "").startswith("https://") else None      # nembo ya mechi (fawa-live) kama picha ya push
 
 
 def log(*a):
@@ -34,7 +39,7 @@ def post(title, message, url):
     log(("[DRY] " if DRY else "📣 ") + title + " | " + message.replace("\n", " ⏐ "))
     if DRY:
         return
-    body = json.dumps({"record": {"title": title, "message": message, "image_url": None, "url": url}}).encode()
+    body = json.dumps({"record": {"title": title, "message": message, "image_url": LOGO, "url": url}}).encode()
     req = urllib.request.Request(PUSH_URL, data=body, method="POST", headers={"Content-Type": "application/json", "x-webhook-secret": PUSH_SECRET})
     try:
         urllib.request.urlopen(req, timeout=30).read()
@@ -174,11 +179,22 @@ def ffmpeg_cmd():
                  "-map", "0:a:0", "-ac", "1", "-ar", str(ga.SR), "-f", "s16le", "pipe:1"]
 
 
+_ocr_lang = [E("OCR_LANG", "eng+ara+fra")]
+
+
 def ocr_text(path):
     from PIL import Image, ImageOps
     import pytesseract
     im = Image.open(path).convert("L"); im = im.resize((im.width * 3, im.height * 3)); a = ImageOps.autocontrast(im)
-    outs = [pytesseract.image_to_string(x, config="--psm 7", lang="eng+ara+fra").strip() for x in (a, ImageOps.invert(a))]
+    outs = []
+    for x in (a, ImageOps.invert(a)):                      # maandishi meupe kwenye giza na kinyume chake
+        try:
+            outs.append(pytesseract.image_to_string(x, config="--psm 7", lang=_ocr_lang[0]).strip())
+        except pytesseract.TesseractError:                 # lugha (ara/fra) haijasakinishwa -> eng tu
+            if _ocr_lang[0] == "eng":
+                raise
+            log("⚠️ Lugha za OCR hazipo; natumia eng tu"); _ocr_lang[0] = "eng"
+            outs.append(pytesseract.image_to_string(x, config="--psm 7", lang="eng").strip())
     return " | ".join(o for o in outs if o)
 
 
@@ -205,53 +221,89 @@ def kickoff_dt():
     return k.replace(tzinfo=None) + (datetime.now() - datetime.now(z).replace(tzinfo=None))   # saa ya mashine
 
 
+class Stream:
+    """ffmpeg moja: sauti inaingia kwenye pipe (thread), picha za scoreboard/banner zinaandikwa kwenye frames/."""
+    def __init__(self):
+        for f in glob.glob("frames/*"):
+            os.remove(f)
+        self.proc = subprocess.Popen(ffmpeg_cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.buf, self.lock, self.t0, self.seen = bytearray(), threading.Lock(), time.time(), -1
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        for c in iter(lambda: self.proc.stdout.read(32000), b""):
+            with self.lock:
+                self.buf.extend(c)
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def seconds(self):
+        with self.lock:
+            n = len(self.buf) // (2 * ga.SR)
+            data = bytes(self.buf[:n * 2 * ga.SR]); del self.buf[:n * 2 * ga.SR]
+        return [np.frombuffer(data[i * 2 * ga.SR:(i + 1) * 2 * ga.SR], dtype=np.int16).astype(np.float32) / 32768.0 for i in range(n)]
+
+    def drained(self):
+        with self.lock:
+            return len(self.buf) < 2 * ga.SR
+
+    def frames(self, final=False):
+        fs = sorted(glob.glob("frames/s_*.jpg"))
+        out = []
+        for f in (fs if final else fs[:-1]):           # ya mwisho inaweza kuwa bado inaandikwa
+            idx = int(re.search(r"s_(\d+)", f)[1])
+            if idx > self.seen:
+                self.seen = idx; out.append((idx, f, f.replace("/s_", "/b_")))
+        return out
+
+    def cleanup(self):
+        for f in sorted(glob.glob("frames/*.jpg"))[:-6]:
+            os.remove(f)
+
+
 def main():
     if not URL:
         sys.exit("❌ URL haijawekwa")
     home, away = mt.split_teams(TITLE)
     os.makedirs("frames", exist_ok=True); os.makedirs("debug", exist_ok=True)
     w = Watcher(home, away, SLUG or "match", kickoff_dt(), post, make_asr(), GoalAudio())
-    started, buf, lock, seen_idx, dbg = time.time(), bytearray(), threading.Lock(), -1, 0
+    started, ever_audio, dbg, every = time.time(), False, 0, max(1, int(E("OCR_EVERY", "2")))
     log(f"▶️ {home} vs {away} | DRY_RUN={DRY} | lugha: {','.join(LANGS)}")
-    while time.time() - started < WAIT_MIN * 60 and not w.done:                  # ngoja stream ianze
-        proc = subprocess.Popen(ffmpeg_cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        threading.Thread(target=lambda: [buf.extend(c) if not lock.acquire() else (buf.extend(c), lock.release()) for c in iter(lambda: proc.stdout.read(32000), b"")], daemon=True).start()
-        t0 = time.time()
-        while proc.poll() is None and time.time() - started < MAX_MIN * 60 and not w.done:
+    if w.kickoff and 0 < (w.kickoff - datetime.now()).total_seconds() <= 25 * 60:      # kikumbusho kimoja kabla ya kuanza
+        post(f"⏰ {home} vs {away}", mt.compose(LANGS, mt.kickoff_message, home=home, away=away, hhmm=w.kickoff.strftime("%H:%M")), w.url)
+    while not w.done and time.time() - started < MAX_MIN * 60:
+        s = Stream()
+        while not w.done and time.time() - started < MAX_MIN * 60:
             time.sleep(0.5)
-            with lock:
-                n = len(buf) // (2 * ga.SR); data = bytes(buf[:n * 2 * ga.SR]); del buf[:n * 2 * ga.SR]
-            for i in range(n):
-                x = np.frombuffer(data[i * 2 * ga.SR:(i + 1) * 2 * ga.SR], dtype=np.int16).astype(np.float32) / 32768.0
-                w.on_second(x, ga.sec_features(x)[0])
-            frames = sorted(glob.glob("frames/s_*.jpg"))
-            for f in frames[:-1]:                                              # ya mwisho inaweza kuwa bado inaandikwa
-                idx = int(re.search(r"s_(\d+)", f)[1])
-                if idx <= seen_idx:
-                    continue
-                seen_idx = idx
-                if idx % 2 and w.now() > w.burst_until:                        # kawaida: kila fremu ya pili; baada ya mngurumo: zote
+            for x in s.seconds():
+                ever_audio = True; w.on_second(x, ga.sec_features(x)[0])
+            for idx, sp, bp in s.frames(final=not s.alive()):
+                if idx % every and w.now() > w.burst_until:      # kawaida: kila fremu ya 'every'; baada ya mngurumo: zote
                     continue
                 try:
-                    st, bt = ocr_text(f), (ocr_text(f.replace("/s_", "/b_")) if os.path.exists(f.replace("/s_", "/b_")) else "")
+                    st, bt = ocr_text(sp), (ocr_text(bp) if os.path.exists(bp) else "")
                 except Exception as e:
                     log("⚠️ OCR imeshindwa:", e); st = bt = ""
-                if SAVE_DEBUG and dbg < 6:
+                if SAVE_DEBUG and dbg < 8:                       # angalia kama sehemu ya kukata (SCORE_BOX/BANNER_BOX) ni sahihi
                     dbg += 1; log(f"🔎 OCR[{idx}] scoreboard='{st}' banner='{bt}'")
-                    os.replace(f, f"debug/{os.path.basename(f)}") if not os.path.exists(f"debug/{os.path.basename(f)}") else None
-                    b = f.replace("/s_", "/b_")
-                    if os.path.exists(b):
-                        subprocess.run(["cp", b, "debug/"])
+                    for p in (sp, bp):
+                        if os.path.exists(p):
+                            subprocess.run(["cp", p, "debug/"])
                 w.on_frame(st, bt)
-            for old in frames[:-4]:
-                if os.path.exists(old):
-                    os.remove(old); b = old.replace("/s_", "/b_"); os.path.exists(b) and os.remove(b)
-            w.tick()
-        proc.kill()
-        if proc.returncode is not None and time.time() - t0 > 120:               # stream ilifanya kazi kisha ikaisha
-            w.tick_all(); w.on_eof(); break
-        if not w.done:
-            log("⏳ stream haijaanza/imekatika, najaribu tena baada ya sekunde 30…"); time.sleep(30)
+            s.cleanup(); w.tick()
+            if not s.alive() and s.drained() and not s.frames(final=True):
+                break
+        s.proc.kill()
+        if w.done:
+            break
+        if ever_audio and time.time() - s.t0 > 120:
+            w.on_eof()                                           # inamaliza tu kama dakika ni 80+
+        if w.done:
+            break
+        if not ever_audio and time.time() - started > WAIT_MIN * 60:
+            log("❌ Stream haikuanza ndani ya muda uliowekwa."); break
+        log("⏳ stream haijaanza au imekatika; najaribu tena baada ya sekunde 30…"); time.sleep(30)
     w.tick_all()
     log("✅ Imemaliza. Goals:", [(g["team"], g["scorer"], g["minute"]) for g in w.goals], "| FT:", w.done)
 
