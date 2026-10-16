@@ -8,7 +8,7 @@ Vyanzo (vyote vya wazi, vinaendeshwa ndani ya GitHub Actions, hakuna API ya nje 
   • Full time: 'FT/Full time/Malizia/نهاية...' kwenye picha mara 2, au stream ikiisha baada ya dakika 80+.
 Push haitumwi kwa sauti peke yake (inaweza kudanganywa na shangwe); inahitaji alama kubadilika kwenye scoreboard.
 Env muhimu: URL, AUTH, SLUG, TITLE, KICKOFF (HH:MM Dar es Salaam), PUSH_URL, PUSH_SECRET, DRY_RUN (default 1: haitumi, inaonyesha tu)."""
-import glob, json, os, re, subprocess, sys, threading, time, urllib.parse, urllib.request
+import csv, glob, json, os, re, subprocess, sys, threading, time, urllib.parse, urllib.request
 from collections import deque
 from datetime import datetime, timedelta
 import numpy as np
@@ -28,6 +28,9 @@ PUSH_URL, PUSH_SECRET = E("PUSH_URL", "") or (f"{CONTENT_URL}/functions/v1/send-
 SCORE_BOX = [float(v) for v in E("SCORE_BOX", "0.02,0.03,0.32,0.09").split(",")]    # x,y,w,h kama sehemu ya fremu
 BANNER_BOX = [float(v) for v in E("BANNER_BOX", "0.05,0.74,0.60,0.14").split(",")]
 SAVE_DEBUG = E("SAVE_DEBUG", "1") != "0"
+# Mafunzo ya automatic: rekodi sauti ya mechi + labels (kutoka scoreboard) na kuzipakia kwenye HF dataset ya private
+COLLECT = E("TRAIN_COLLECT", "1") != "0"
+DATA_REPO, HF_TOKEN, REC_PATH = E("DATA_REPO", "jaynesmaxtv/goal-audio"), E("HF_TOKEN", "").strip(), "match_audio.pcm"
 LOGO = E("LOGO", "").strip() if E("LOGO", "").startswith("https://") else None      # nembo ya mechi (fawa-live) kama picha ya push
 
 
@@ -74,13 +77,18 @@ class Watcher:
         self.score, self.cand, self.cand_n, self.clock = None, None, 0, None
         self.goals, self.pending, self.ft_n, self.done, self.burst_until = [], [], 0, False, 0
         self.audio = deque(maxlen=120)
+        self.dbs, self.alerts, self.labels, self.rec = [], [], [], None     # kwa mafunzo ya automatic
         self.exclude = re.findall(r"[^\W\d_]{3,}", f"{home} {away}")
         self.url = "./#/match/" + urllib.parse.quote(slug)
 
     # ── sauti ──
     def on_second(self, x, row):
         self.audio.append(x)
+        self.dbs.append(float(row[0]))
+        if self.rec:
+            self.rec.write((np.clip(x, -1, 1) * 32767).astype(np.int16).tobytes())
         if self.ga and self.ga.push(row):
+            self.alerts.append(len(self.dbs))
             self.burst_until = self.now() + 45
             log("🔊 Mngurumo unaofanana na goal (sauti). Nangoja uthibitisho wa scoreboard…")
 
@@ -108,6 +116,33 @@ class Watcher:
             if name and not g["banner"]:
                 g["banner"] = name
 
+    def _onset(self, n, back=50):
+        """Sekunde ambapo mngurumo wa sauti ulianza ndani ya sekunde 'back' kabla ya n; None ikikosekana."""
+        d = self.dbs
+        if n < 130:
+            return None
+        base = float(np.median(d[max(0, n - 150):n - 60]))
+        win = range(max(0, n - back), n - 2)
+        best = max(win, key=lambda t: sum(d[t:t + 3]))
+        if sum(d[best:best + 3]) / 3 < base + 8:
+            return None
+        while best > 0 and d[best - 1] >= base + 6:
+            best -= 1
+        return best
+
+    def collect_rows(self):
+        """Labels za automatic: goal = alama ya scoreboard iliyothibitishwa + mngurumo; near_miss = mngurumo bila goal."""
+        rows = sorted(self.labels)
+        goals = [t for t, _ in rows]
+        last = -1e9
+        for a in self.alerts:
+            if any(g - 10 <= a <= g + 50 for g in goals) or a - last < 60:
+                continue
+            last = a
+            t = self._onset(a, 30)
+            rows.append((t if t is not None else max(0, a - 6), "near_miss"))
+        return sorted(rows)
+
     def _minute(self):
         if self.clock is not None:
             return self.clock, False
@@ -122,6 +157,12 @@ class Watcher:
             self.cand, self.cand_n = None, 0
             return
         minute, approx = self._minute()
+        if COLLECT and da + db == 1:
+            t = self._onset(len(self.dbs))
+            if t is not None:
+                self.labels.append((t, "goal")); log(f"🏷️ Label ya goal (automatic): sekunde {t} ya rekodi")
+            else:
+                log("🏷️ Goli limethibitishwa lakini mngurumo wa sauti haukupatikana; sitaweka label")
         scorer = None
         if self.asr:
             try:
@@ -262,12 +303,45 @@ class Stream:
             os.remove(f)
 
 
+def upload_training(w):
+    """Mwisho wa mechi: pakia mp3 + labels kwenye HF dataset (private). Train goal model itazitumia yenyewe."""
+    if not (COLLECT and HF_TOKEN and w.rec):
+        return
+    w.rec.close()
+    rows = w.collect_rows()
+    if w.score is None or not rows or not os.path.exists(REC_PATH):
+        log("ℹ️ Hakuna data ya mafunzo ya kupakia (scoreboard haikusomeka au hakuna tukio)."); return
+    name = re.sub(r"[^A-Za-z0-9_-]+", "-", f"{SLUG or 'match'}-{datetime.now():%Y%m%d}").strip("-") + ".mp3"
+    r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "s16le", "-ar", str(ga.SR), "-ac", "1", "-i", REC_PATH,
+                        "-c:a", "libmp3lame", "-b:a", "48k", name])
+    if r.returncode or not os.path.exists(name):
+        log("⚠️ Kubadilisha rekodi kuwa mp3 kumeshindwa"); return
+    csv_name = name[:-4] + ".csv"
+    with open(csv_name, "w", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f); wr.writerow(["file", "sec", "label"])
+        for t, lab in rows:
+            wr.writerow([name, t, lab])
+    from huggingface_hub import HfApi
+    api = HfApi(token=HF_TOKEN)
+    api.create_repo(DATA_REPO, repo_type="dataset", private=True, exist_ok=True)
+    for attempt in range(3):
+        try:
+            api.upload_file(path_or_fileobj=name, path_in_repo=f"audio/{name}", repo_id=DATA_REPO, repo_type="dataset")
+            api.upload_file(path_or_fileobj=csv_name, path_in_repo=f"audio/labels/{csv_name}", repo_id=DATA_REPO, repo_type="dataset")
+            log(f"📦 Data ya mafunzo imepakiwa: {name} (labels {len(rows)}: goal {sum(1 for _, l in rows if l == 'goal')}, near_miss {sum(1 for _, l in rows if l == 'near_miss')})")
+            return
+        except Exception as e:
+            log(f"⚠️ Kupakia kumeshindwa (jaribio {attempt + 1}/3): {e}"); time.sleep(10)
+
+
 def main():
     if not URL:
         sys.exit("❌ URL haijawekwa")
     home, away = mt.split_teams(TITLE)
     os.makedirs("frames", exist_ok=True); os.makedirs("debug", exist_ok=True)
     w = Watcher(home, away, SLUG or "match", kickoff_dt(), post, make_asr(), GoalAudio())
+    if COLLECT:
+        w.rec = open(REC_PATH, "wb")
     started, ever_audio, dbg, every = time.time(), False, 0, max(1, int(E("OCR_EVERY", "2")))
     log(f"▶️ {home} vs {away} | DRY_RUN={DRY} | lugha: {','.join(LANGS)}")
     if w.kickoff and 0 < (w.kickoff - datetime.now()).total_seconds() <= 25 * 60:      # kikumbusho kimoja kabla ya kuanza
@@ -306,6 +380,10 @@ def main():
         log("⏳ stream haijaanza au imekatika; najaribu tena baada ya sekunde 30…"); time.sleep(30)
     w.tick_all()
     log("✅ Imemaliza. Goals:", [(g["team"], g["scorer"], g["minute"]) for g in w.goals], "| FT:", w.done)
+    try:
+        upload_training(w)
+    except Exception as e:
+        log("⚠️ Data ya mafunzo haikupakiwa:", e)
 
 
 if __name__ == "__main__":
