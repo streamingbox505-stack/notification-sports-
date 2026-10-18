@@ -50,7 +50,7 @@ jobs:
           CONTENT_KEY: ${{ secrets.CONTENT_KEY }}
           PUSH_SECRET: ${{ secrets.PUSH_SECRET }}
           WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'small' }}
-          PUSH_LANGS: ${{ vars.PUSH_LANGS || 'sw,en,fr,ar' }}
+          PUSH_LANGS: sw   # Kiswahili tu
           SCORE_BOX: ${{ vars.SCORE_BOX || '0.02,0.03,0.32,0.09' }}
           BANNER_BOX: ${{ vars.BANNER_BOX || '0.05,0.74,0.60,0.14' }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -63,4 +63,3 @@ jobs:
           name: debug-frames
           path: debug/
           if-no-files-found: ignore
-          
