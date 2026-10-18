@@ -10,6 +10,7 @@ FT_WORDS = {"sw": ["mwisho wa mchezo", "mwisho wa mechi", "filimbi ya mwisho", "
             "fr": ["fin du match", "coup de sifflet final", "temps réglementaire"],
             "ar": ["نهاية المباراة", "صافرة النهاية", "انتهت المباراة"]}
 FT_OCR = re.compile(r"(?<![A-Za-z])(FT|FULL[\s-]?TIME|FINAL|FIN|MALIZIA|MWISHO)(?![A-Za-z])|نهاية|انتهت|إنتهت", re.I)
+HT_OCR = re.compile(r"(?<![A-Za-z])(HT|HALF[\s-]?TIME|MI[\s-]?TEMPS|MAPUMZIKO|NUSU)(?![A-Za-z])|استراحة|نهاية الشوط", re.I)
 AR_MARK = {"سجل", "يسجل", "سجّل", "بتوقيع", "عبر", "بواسطة"}
 AR_STOP = {"هدف", "جول", "في", "من", "الأول", "الثاني", "الثالث", "رائع", "جميل", "المباراة", "للفريق", "هنا", "إنه", "انه"}
 STOP = {"goal", "goals", "but", "goli", "gori", "bao", "the", "and", "what", "he", "it", "oh", "yes", "wow", "le", "la", "les", "un", "une",
@@ -17,7 +18,11 @@ STOP = {"goal", "goals", "but", "goli", "gori", "bao", "the", "and", "what", "he
 BANNER_STOP = {"goal", "gool", "but", "goli", "gori", "bao", "scored", "penalty", "pen", "own", "og", "assist", "ft", "ht", "vs", "fc", "min", "هدف"}
 MIN_FMT = {"sw": "dk {m}'", "en": "{m}'", "fr": "{m}e", "ar": "د{m}"}
 HEAD = {"goal": {"sw": "⚽ GOLI!", "en": "⚽ GOAL!", "fr": "⚽ BUT !", "ar": "⚽ هدف!"},
-        "ft": {"sw": "🏁 Mwisho wa mechi", "en": "🏁 Full time", "fr": "🏁 Fin du match", "ar": "🏁 نهاية المباراة"}}
+        "ft": {"sw": "🏁 Mwisho wa mechi", "en": "🏁 Full time", "fr": "🏁 Fin du match", "ar": "🏁 نهاية المباراة"},
+        "ko": {"sw": "▶️ Mechi imeanza", "en": "▶️ Kick-off", "fr": "▶️ Coup d'envoi", "ar": "▶️ انطلقت المباراة"},
+        "ht": {"sw": "⏸️ Mapumziko", "en": "⏸️ Half time", "fr": "⏸️ Mi-temps", "ar": "⏸️ استراحة"},
+        "sh": {"sw": "▶️ Kipindi cha pili kimeanza", "en": "▶️ Second half", "fr": "▶️ Début de la 2e mi-temps", "ar": "▶️ بدأ الشوط الثاني"}}
+ICON = {"goal": "⚽", "ft": "🏁", "ht": "⏸️", "ko": "▶️", "sh": "▶️"}
 
 
 def split_teams(title):
@@ -110,13 +115,33 @@ def goal_message(lang, team, scorer=None, minute=None, approx=False):
     return f"{HEAD['goal'][lang]} {team}" + (f" — {w}" if w else "")
 
 
+def _summary(head, goals):
+    items = []
+    for g in goals:
+        who = f"{g['scorer']} ({g['team']})" if g.get("scorer") else g["team"]
+        mn = ("~" if g.get("approx") else "") + str(g["minute"]) + "'" if g.get("minute") is not None else ""
+        items.append(f"{who} {mn}".strip())
+    return head + (": " + ", ".join(items) if items else "")
+
+
 def ft_message(lang, goals):
-    items = [f"{g.get('scorer') or g['team']} {('~' if g.get('approx') else '') + str(g['minute']) + chr(39) if g.get('minute') is not None else ''}".strip() for g in goals]
-    return HEAD["ft"][lang] + (": " + ", ".join(items) if items else "")
+    return _summary(HEAD["ft"][lang], goals)
+
+
+def ht_message(lang, goals):
+    return _summary(HEAD["ht"][lang], goals)
+
+
+def ko_message(lang, home, away):
+    return f"{HEAD['ko'][lang]}: {home} vs {away}"
+
+
+def sh_message(lang, home, away):
+    return f"{HEAD['sh'][lang]}: {home} vs {away}"
 
 
 def push_title(kind, home, hs, away, as_):
-    return f"{'⚽' if kind == 'goal' else '🏁'} {home} {hs}-{as_} {away}"
+    return f"{ICON.get(kind, '🏁')} {home} {hs}-{as_} {away}"
 
 
 def compose(langs, fn, limit=240, **kw):
