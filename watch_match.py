@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""watch_match.py — hufuatilia mechi live: goal, aliyefunga, timu, dakika, na full time; hutuma push kwa lugha 4 (sw, en, fr, ar).
+"""watch_match.py — hufuatilia mechi live kuanzia mwanzo hadi mwisho: kick-off, goal (timu + mfungaji + dakika), mapumziko (HT), kipindi cha pili na full time; hutuma push kwa Kiswahili tu.
 
 Vyanzo (vyote vya wazi, vinaendeshwa ndani ya GitHub Actions, hakuna API ya nje ya matokeo):
   • Picha: scoreboard ya stream inasomwa kwa OCR (Tesseract) -> alama na dakika. Alama ikibadilika mara 2 mfululizo = goli la KWELI.
@@ -23,11 +23,12 @@ URL = E("URL", "").strip() or (f"{CONTENT_URL}/functions/v1/fawa-live/proxy?slug
 AUTH = E("AUTH", "").strip() or (f"Bearer {CONTENT_KEY}" if CONTENT_KEY else "")
 KICKOFF, MAX_MIN, WAIT_MIN = E("KICKOFF", "").strip(), int(E("MAX_MINUTES", "150")), int(E("WAIT_START_MIN", "25"))
 DRY, SCORER_WAIT, WHISPER = E("DRY_RUN", "1") != "0", int(E("SCORER_WAIT", "12")), E("WHISPER_MODEL", "small")
-LANGS = [l for l in E("PUSH_LANGS", "sw,en,fr,ar").split(",") if l in mt.LANGS] or ["sw", "en"]
+LANGS = [l for l in E("PUSH_LANGS", "sw").split(",") if l in mt.LANGS] or ["sw", "en"]
 PUSH_URL, PUSH_SECRET = E("PUSH_URL", "") or (f"{CONTENT_URL}/functions/v1/send-push" if CONTENT_URL else ""), E("PUSH_SECRET", "")
 SCORE_BOX = [float(v) for v in E("SCORE_BOX", "0.02,0.03,0.32,0.09").split(",")]    # x,y,w,h kama sehemu ya fremu
 BANNER_BOX = [float(v) for v in E("BANNER_BOX", "0.05,0.74,0.60,0.14").split(",")]
 SAVE_DEBUG = E("SAVE_DEBUG", "1") != "0"
+HT_STALE, HT_MIN_GAP = int(E("HT_STALE_SEC", "180")), int(E("HT_MIN_GAP_SEC", "240"))   # saa ikisimama dakika 45+ kwa sekunde HT_STALE = mapumziko; kipindi cha pili hakitangazwi kabla ya HT_MIN_GAP
 # Mafunzo ya automatic: rekodi sauti ya mechi + labels (kutoka scoreboard) na kuzipakia kwenye HF dataset ya private
 COLLECT = E("TRAIN_COLLECT", "1") != "0"
 DATA_REPO, HF_TOKEN, REC_PATH = E("DATA_REPO", "jaynesmaxtv/goal-audio"), E("HF_TOKEN", "").strip(), "match_audio.pcm"
@@ -77,6 +78,9 @@ class Watcher:
         self.score, self.cand, self.cand_n, self.clock = None, None, 0, None
         self.goals, self.pending, self.ft_n, self.done, self.burst_until = [], [], 0, False, 0
         self.audio = deque(maxlen=120)
+        # hatua za mechi (kutoka video): pre -> first -> ht -> second -> ft
+        self.phase, self.ko_n, self.late_n, self.ht_n, self.ht_gone = "pre", 0, 0, 0, 0
+        self.last_clk, self.clk_t, self.ht_time, self.ht_clk, self.ht_text = None, 0, None, None, False
         self.dbs, self.alerts, self.labels, self.rec = [], [], [], None     # kwa mafunzo ya automatic
         self.exclude = re.findall(r"[^\W\d_]{3,}", f"{home} {away}")
         self.url = "./#/match/" + urllib.parse.quote(slug)
@@ -100,6 +104,7 @@ class Watcher:
         if self.ft_n >= 2 and self.score is not None:
             return self.finish("scoreboard (FT)")
         sb = mt.parse_scorebug(score_txt)
+        self._phase(f"{score_txt} {banner_txt}", sb["clock"] if sb else mt.parse_clock(score_txt))
         if sb:
             if sb["clock"] is not None:
                 self.clock = sb["clock"]
@@ -115,6 +120,39 @@ class Watcher:
         for g in self.pending:
             if name and not g["banner"]:
                 g["banner"] = name
+
+    def _announce(self, kind, fn, **kw):
+        sc = self.score or (0, 0)
+        self.push(mt.push_title(kind, self.home, sc[0], self.away, sc[1]), mt.compose(LANGS, fn, **kw), self.url)
+
+    def _phase(self, text, clk):
+        """Inagundua kuanza (kick-off), mapumziko (HT) na kipindi cha pili kutoka scoreboard ya video."""
+        now = self.now()
+        if clk is not None and clk != self.last_clk:
+            self.last_clk, self.clk_t = clk, now
+        ht_seen = bool(mt.HT_OCR.search(text))
+        if self.phase == "pre":
+            self.ko_n = self.ko_n + 1 if clk is not None and 1 <= clk <= 3 else 0
+            self.late_n = self.late_n + 1 if clk is not None and clk > 3 else 0
+            if self.ko_n >= 2:
+                self.phase = "first"; log("▶️ Mechi imeanza (saa kwenye scoreboard)")
+                self._announce("ko", mt.ko_message, home=self.home, away=self.away)
+            elif self.late_n >= 2:                    # tumejiunga mechi ikiwa tayari inaendelea; hatutangazi kick-off
+                self.phase = "second" if clk >= 46 else "first"; log(f"ℹ️ Mechi ilikuwa tayari imeanza (dakika {clk})")
+        elif self.phase == "first":
+            self.ht_n = self.ht_n + 1 if ht_seen else 0
+            frozen = (clk is not None and clk == self.last_clk and clk >= 45 and now - self.clk_t >= HT_STALE)
+            if self.ht_n >= 2 or frozen:
+                self.tick_all()
+                self.phase, self.ht_time, self.ht_clk, self.ht_text, self.ht_gone = "ht", now, self.last_clk, self.ht_n >= 2, 0
+                log(f"⏸️ Mapumziko ({'HT kwenye scoreboard' if self.ht_text else 'saa imesimama'})")
+                self._announce("ht", mt.ht_message, goals=self.goals)
+        elif self.phase == "ht":
+            self.ht_gone = 0 if ht_seen else self.ht_gone + 1
+            resumed = clk is not None and clk >= 45 and (self.ht_text or clk != self.ht_clk)
+            if self.ht_gone >= 3 and resumed and now - self.ht_time >= HT_MIN_GAP:
+                self.phase = "second"; log("▶️ Kipindi cha pili kimeanza")
+                self._announce("sh", mt.sh_message, home=self.home, away=self.away)
 
     def _onset(self, n, back=50):
         """Sekunde ambapo mngurumo wa sauti ulianza ndani ya sekunde 'back' kabla ya n; None ikikosekana."""
@@ -192,7 +230,7 @@ class Watcher:
         if self.done or self.score is None:
             return
         self.tick_all()
-        self.done = True
+        self.done, self.phase = True, "ft"
         log(f"🏁 Mwisho wa mechi ({why})")
         self.push(mt.push_title("ft", self.home, self.score[0], self.away, self.score[1]),
                   mt.compose(LANGS, mt.ft_message, goals=self.goals), self.url)
